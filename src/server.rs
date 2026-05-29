@@ -4,21 +4,29 @@ use rmcp::{
 };
 use tracing::debug;
 
-use crate::api::TwilioClient;
-use crate::params::{GetMessageStatusParams, SendMessageParams, SendTemplateParams};
+use crate::api::MetaClient;
+use crate::params::{SendMessageParams, SendTemplateParams};
 
-/// The MCP server wrapping the Twilio WhatsApp API.
+/// The MCP server wrapping the Meta WhatsApp Cloud API.
 #[derive(Clone)]
 pub struct WhatsAppServer {
-    client: std::sync::Arc<TwilioClient>,
+    client: std::sync::Arc<MetaClient>,
     tool_router: ToolRouter<Self>,
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Tool definitions
 // ---------------------------------------------------------------------------
 
+#[tool_router]
 impl WhatsAppServer {
+    pub fn new(client: MetaClient) -> Self {
+        Self {
+            client: std::sync::Arc::new(client),
+            tool_router: Self::tool_router(),
+        }
+    }
+
     /// Strip the `whatsapp:` prefix if present, then validate E.164 format.
     /// Returns the clean phone number (without prefix).
     fn normalize_phone(number: &str) -> Result<String, McpError> {
@@ -34,49 +42,10 @@ impl WhatsAppServer {
         Ok(clean.to_string())
     }
 
-    /// Validate a media URL starts with http(s).
-    fn validate_media_url(url: &str) -> Result<(), McpError> {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(McpError::invalid_params(
-                "media_url must start with http:// or https://",
-                None,
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validate a Twilio Message SID (alphanumeric, starts with "SM").
-    fn validate_message_sid(sid: &str) -> Result<(), McpError> {
-        if !sid.starts_with("SM") || sid.len() != 34 || !sid.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(McpError::invalid_params(
-                format!(
-                    "Message SID must be 34 alphanumeric characters starting with \"SM\", got \"{sid}\""
-                ),
-                None,
-            ));
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tool definitions
-// ---------------------------------------------------------------------------
-
-#[tool_router]
-impl WhatsAppServer {
-    pub fn new(client: TwilioClient) -> Self {
-        Self {
-            client: std::sync::Arc::new(client),
-            tool_router: Self::tool_router(),
-        }
-    }
-
     #[tool(
-        description = "Send a WhatsApp message via Twilio. Sends a free-form text message \
-                        (with optional media attachment) to a phone number. Note: free-form \
-                        messages only work within a 24-hour session window after the recipient \
-                        has messaged you first, or when using the Twilio sandbox."
+        description = "Send a free-form WhatsApp text message via the Meta Cloud API. \
+                        Free-form messages can only be sent inside an active 24-hour customer \
+                        service window (after the recipient has messaged you)."
     )]
     async fn send_message(
         &self,
@@ -85,15 +54,7 @@ impl WhatsAppServer {
         let to = Self::normalize_phone(&p.to)?;
         debug!(to = %to, "send_message tool called");
 
-        if let Some(media) = &p.media_url {
-            Self::validate_media_url(media)?;
-        }
-
-        match self
-            .client
-            .send_message(&to, &p.body, p.media_url.as_deref())
-            .await
-        {
+        match self.client.send_message(&to, &p.body).await {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
                 resp.to_string(),
             )])),
@@ -102,30 +63,21 @@ impl WhatsAppServer {
     }
 
     #[tool(
-        description = "Send a pre-approved WhatsApp template message via Twilio. Template \
-                        messages are required to initiate conversations outside the 24-hour \
-                        session window. Templates must be created and approved in the Twilio \
-                        Console first."
+        description = "Send a pre-approved WhatsApp template message via the Meta Cloud API. \
+                        Template messages are required to initiate conversations outside the \
+                        24-hour customer service window. Templates must be created and approved \
+                        in WhatsApp Manager first."
     )]
     async fn send_template(
         &self,
         Parameters(p): Parameters<SendTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
         let to = Self::normalize_phone(&p.to)?;
-        debug!(to = %to, content_sid = %p.content_sid, "send_template tool called");
-
-        if let Some(vars) = &p.content_variables {
-            serde_json::from_str::<serde_json::Value>(vars).map_err(|e| {
-                McpError::invalid_params(
-                    format!("Invalid content_variables JSON: {e}"),
-                    None,
-                )
-            })?;
-        }
+        debug!(to = %to, template = %p.template_name, "send_template tool called");
 
         match self
             .client
-            .send_template(&to, &p.content_sid, p.content_variables.as_deref())
+            .send_template(&to, &p.template_name, &p.language_code, p.components.as_deref())
             .await
         {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
@@ -135,24 +87,6 @@ impl WhatsAppServer {
         }
     }
 
-    #[tool(
-        description = "Check the delivery status of a previously sent WhatsApp message. \
-                        Status progresses: queued → sent → delivered → read (or failed/undelivered)."
-    )]
-    async fn get_message_status(
-        &self,
-        Parameters(p): Parameters<GetMessageStatusParams>,
-    ) -> Result<CallToolResult, McpError> {
-        Self::validate_message_sid(&p.message_sid)?;
-        debug!(message_sid = %p.message_sid, "get_message_status tool called");
-
-        match self.client.get_message_status(&p.message_sid).await {
-            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
-                resp.to_string(),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,8 +102,9 @@ impl ServerHandler for WhatsAppServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Twilio WhatsApp MCP server. Tools: send_message, send_template, \
-                 get_message_status.",
+                "Meta WhatsApp Cloud API MCP server. Tools: send_message, send_template. \
+                 Free-form messages only work inside a 24h customer service window. \
+                 Use templates to initiate new conversations.",
             )
     }
 }
@@ -210,40 +145,4 @@ mod tests {
         assert!(WhatsAppServer::normalize_phone("+2782 1234567").is_err());
     }
 
-    // -- validate_media_url ---------------------------------------------------
-
-    #[test]
-    fn validate_media_url_valid() {
-        assert!(WhatsAppServer::validate_media_url("https://example.com/img.jpg").is_ok());
-        assert!(WhatsAppServer::validate_media_url("http://example.com/img.jpg").is_ok());
-    }
-
-    #[test]
-    fn validate_media_url_invalid() {
-        assert!(WhatsAppServer::validate_media_url("ftp://example.com/img.jpg").is_err());
-        assert!(WhatsAppServer::validate_media_url("not-a-url").is_err());
-    }
-
-    // -- validate_message_sid -------------------------------------------------
-
-    #[test]
-    fn validate_message_sid_valid() {
-        // Twilio SIDs are "SM" + 32 hex chars = 34 total
-        assert!(WhatsAppServer::validate_message_sid("SM0123456789abcdef0123456789abcdef").is_ok());
-    }
-
-    #[test]
-    fn validate_message_sid_wrong_prefix() {
-        assert!(WhatsAppServer::validate_message_sid("XX0123456789abcdef0123456789abcdef").is_err());
-    }
-
-    #[test]
-    fn validate_message_sid_wrong_length() {
-        assert!(WhatsAppServer::validate_message_sid("SM123").is_err());
-    }
-
-    #[test]
-    fn validate_message_sid_path_traversal() {
-        assert!(WhatsAppServer::validate_message_sid("../../Calls").is_err());
-    }
 }

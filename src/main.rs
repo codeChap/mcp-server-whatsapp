@@ -8,7 +8,7 @@ use rmcp::{ServiceExt, transport::stdio};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use api::TwilioClient;
+use api::MetaClient;
 use server::WhatsAppServer;
 
 #[tokio::main]
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
     info!("loading config");
     let cfg = config::load()?;
-    let client = TwilioClient::new(cfg.account_sid, cfg.auth_token, cfg.from_number);
+    let client = MetaClient::new(cfg.access_token, cfg.phone_number_id, cfg.api_version);
     let server = WhatsAppServer::new(client);
 
     info!("starting MCP server via stdio");
